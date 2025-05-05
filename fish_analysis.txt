@@ -1,0 +1,7 @@
+======= FISH ANALYSIS =======
+Fish component found
+Fish has 1 children
+Child 0 found
+Child 0 GameObject found
+Child 0 has name object
+======= ANALYSIS COMPLETE =======
