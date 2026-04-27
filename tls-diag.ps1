@@ -305,9 +305,7 @@ function Test-TlsEndpoint {
         chain        = @()
     }
 
-    $tcp = $null; $ssl = $null
-    $script:_capturedChain  = $null
-    $script:_capturedErrors = $null
+    $tcp = $null; $ssl = $null; $ns = $null
 
     try {
         $tcp = New-Object Net.Sockets.TcpClient
@@ -319,29 +317,37 @@ function Test-TlsEndpoint {
         $tcp.ReceiveTimeout = $TimeoutMs
         $tcp.SendTimeout    = $TimeoutMs
 
-        $callback = {
-            param($s, $cert, $chain, $errors)
-            $script:_capturedChain  = $chain
-            $script:_capturedErrors = $errors
-            return $true
-        }
-        $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, $callback)
+        # Синхронный handshake: callback не нужен — шифр и сертификат
+        # достанем из SslStream/RemoteCertificate, а ошибки цепочки пересоберём
+        # вручную через X509Chain.Build после успешного TLS.
+        # (Async + script-block callback ломается под `iex`: на ThreadPool потоке
+        #  нет DefaultRunspace и PowerShell не может выполнить script-block.)
+        $ns = $tcp.GetStream()
+        $ns.ReadTimeout  = $TimeoutMs
+        $ns.WriteTimeout = $TimeoutMs
+        # Принимаем любой сертификат на этапе handshake — всё валидируем потом
+        $acceptAll = [Net.Security.RemoteCertificateValidationCallback]{ param($a,$b,$c,$d) return $true }
+        $ssl = New-Object Net.Security.SslStream($ns, $false, $acceptAll)
 
         $protocols = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
-        # Таймаут и на сам TLS hand (а не только на TCP connect)
-        $task = $ssl.AuthenticateAsClientAsync($TargetHost, $null, $protocols, $false)
-        if (-not $task.Wait($TimeoutMs)) {
-            throw "TLS handshake timeout after ${TimeoutMs}ms"
-        }
-        if ($task.IsFaulted) { throw $task.Exception.GetBaseException() }
+        $ssl.AuthenticateAsClient($TargetHost, $null, $protocols, $false)
 
         $out.ok           = $true
         $out.negotiated   = $ssl.SslProtocol.ToString()
         $out.cipher       = "$($ssl.CipherAlgorithm)/$($ssl.HashAlgorithm)/$($ssl.KeyExchangeAlgorithm)"
-        $out.chain_errors = "$script:_capturedErrors"
 
-        if ($script:_capturedChain) {
-            foreach ($el in $script:_capturedChain.ChainElements) {
+        # Собираем цепочку и ошибки независимо, через X509Chain
+        $remote = $ssl.RemoteCertificate
+        if ($remote) {
+            $leaf  = New-Object Security.Cryptography.X509Certificates.X509Certificate2 $remote
+            $bChain = New-Object Security.Cryptography.X509Certificates.X509Chain
+            $bChain.ChainPolicy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+            [void]$bChain.Build($leaf)
+            $errs = ($bChain.ChainStatus | ForEach-Object { $_.Status.ToString() }) -join ","
+            if (-not $errs) { $errs = "NoError" }
+            $out.chain_errors = $errs
+
+            foreach ($el in $bChain.ChainElements) {
                 $status = ($el.ChainElementStatus | ForEach-Object { $_.Status.ToString() }) -join ","
                 $out.chain += [ordered]@{
                     subject    = $el.Certificate.Subject
